@@ -35,18 +35,56 @@ impl OAuthFlow {
         let registration = register_client(&metadata, app_info, scope).await?;
         log::info!("Registered client: {}", registration.client_id);
 
-        let pkce_verifier = generate_code_verifier();
-        let state = generate_code_verifier(); // reuse verifier generation for state param
+        Ok(Self::with_metadata(
+            metadata,
+            registration.client_id,
+            resource_url,
+            &app_info.redirect_uri,
+            scope,
+        ))
+    }
 
-        Ok(Self {
-            client_id: registration.client_id,
+    /// Discover the authorization server metadata while using a pre-registered
+    /// public client. This is the declarative counterpart to
+    /// [`Self::discover_and_register`]: no registration request is made and the
+    /// client id can be supplied by configuration management.
+    pub async fn discover_with_client_id(
+        resource_url: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        scope: &str,
+    ) -> Result<Self, OAuthError> {
+        log::info!("Starting OAuth discovery for {resource_url} using configured client");
+        let metadata = discover_oauth_metadata(resource_url).await?;
+        Ok(Self::with_metadata(
+            metadata,
+            client_id.to_string(),
+            resource_url,
+            redirect_uri,
+            scope,
+        ))
+    }
+
+    /// Construct a flow from already-discovered metadata and a configured
+    /// client id. Useful for callers that cache RFC 8414 metadata themselves.
+    pub fn with_metadata(
+        metadata: OAuthMetadata,
+        client_id: impl Into<String>,
+        resource_url: &str,
+        redirect_uri: &str,
+        scope: &str,
+    ) -> Self {
+        let pkce_verifier = generate_code_verifier();
+        let state = generate_code_verifier();
+        Self {
+            client_id: client_id.into(),
             resource: resource_url.to_string(),
-            redirect_uri: app_info.redirect_uri.clone(),
+            redirect_uri: redirect_uri.to_string(),
             pkce_verifier,
             state,
             metadata,
             scope: scope.to_string(),
-        })
+        }
     }
 
     /// Build the authorization URL to open in the user's browser.
@@ -74,7 +112,10 @@ impl OAuthFlow {
 
         log::debug!("OAuth: waiting for browser redirect...");
         let (code, state) = handler.wait_for_redirect().await?;
-        log::debug!("OAuth: received code ({} chars), verifying state", code.len());
+        log::debug!(
+            "OAuth: received code ({} chars), verifying state",
+            code.len()
+        );
 
         if state != self.state {
             log::error!("OAuth: state mismatch");

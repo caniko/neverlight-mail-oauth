@@ -32,7 +32,14 @@ impl LocalServerRedirect {
     ///
     /// `app_name` is shown in the browser success page (e.g. "Neverlight Mail").
     pub async fn bind(app_name: &str) -> Result<Self, OAuthError> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        Self::bind_on(app_name, 0).await
+    }
+
+    /// Bind the callback listener to a fixed loopback port. Pre-registered
+    /// OAuth clients need an exact redirect URI, so declarative integrations
+    /// can reserve one deterministic callback endpoint.
+    pub async fn bind_on(app_name: &str, port: u16) -> Result<Self, OAuthError> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| OAuthError::Redirect(format!("Failed to bind redirect listener: {e}")))?;
 
@@ -42,7 +49,11 @@ impl LocalServerRedirect {
             .port();
 
         log::info!("OAuth redirect listener bound to 127.0.0.1:{port}");
-        Ok(Self { listener, port, app_name: app_name.to_string() })
+        Ok(Self {
+            listener,
+            port,
+            app_name: app_name.to_string(),
+        })
     }
 }
 
@@ -98,11 +109,9 @@ impl OAuthRedirectHandler for LocalServerRedirect {
                              </body></html>",
                             html_escape(&self.app_name),
                         );
-                        let _ = tokio::io::AsyncWriteExt::write_all(
-                            &mut stream,
-                            response.as_bytes(),
-                        )
-                        .await;
+                        let _ =
+                            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                                .await;
                         let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
 
                         return Ok((code, state));
@@ -110,11 +119,9 @@ impl OAuthRedirectHandler for LocalServerRedirect {
                     Err(_) => {
                         // Send 404 for non-callback requests and keep listening
                         let response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                        let _ = tokio::io::AsyncWriteExt::write_all(
-                            &mut stream,
-                            response.as_bytes(),
-                        )
-                        .await;
+                        let _ =
+                            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                                .await;
                         let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
                         log::debug!("OAuth redirect: non-callback request, waiting for next");
                         continue;
@@ -123,7 +130,9 @@ impl OAuthRedirectHandler for LocalServerRedirect {
             }
         })
         .await
-        .map_err(|_| OAuthError::Redirect("Timed out waiting for browser authorization (120s)".into()))?
+        .map_err(|_| {
+            OAuthError::Redirect("Timed out waiting for browser authorization (120s)".into())
+        })?
     }
 }
 
@@ -187,7 +196,8 @@ fn url_decode(s: &str) -> String {
             result.push(b);
         }
     }
-    String::from_utf8(result).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
+    String::from_utf8(result)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 fn hex_val(b: u8) -> Option<u8> {

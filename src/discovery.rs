@@ -31,13 +31,16 @@ async fn discover_resource_metadata_url(
     http: &reqwest::Client,
     resource_url: &str,
 ) -> Result<String, OAuthError> {
-    let resp = http
-        .get(resource_url)
-        .send()
-        .await?;
+    let resp = http.get(resource_url).send().await?;
 
-    // We expect 401 Unauthorized with WWW-Authenticate header
+    // RFC 9728 normally advertises the metadata URL in a 401 challenge. Some
+    // servers (including Stalwart deployments behind a public reverse proxy)
+    // answer the unauthenticated request successfully; try the standard
+    // same-origin well-known endpoint in that case.
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status().is_success() {
+            return same_origin_resource_metadata_url(resource_url);
+        }
         return Err(OAuthError::Discovery(format!(
             "Expected 401 from unauthenticated resource request, got {}",
             resp.status()
@@ -56,6 +59,20 @@ async fn discover_resource_metadata_url(
     parse_resource_metadata_url(www_auth)
 }
 
+fn same_origin_resource_metadata_url(resource_url: &str) -> Result<String, OAuthError> {
+    let parsed = reqwest::Url::parse(resource_url).map_err(|e| {
+        OAuthError::Discovery(format!("Invalid resource URL '{resource_url}': {e}"))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        OAuthError::Discovery(format!("Resource URL has no host: {resource_url}"))
+    })?;
+    let origin = match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    };
+    Ok(format!("{origin}/.well-known/oauth-protected-resource"))
+}
+
 /// Parse `resource_metadata` from a `WWW-Authenticate: Bearer` header value.
 fn parse_resource_metadata_url(www_auth: &str) -> Result<String, OAuthError> {
     // Look for resource_metadata="<url>" in the header value
@@ -67,22 +84,16 @@ fn parse_resource_metadata_url(www_auth: &str) -> Result<String, OAuthError> {
     })? + needle.len();
 
     let rest = &www_auth[start..];
-    let end = rest.find('"').ok_or_else(|| {
-        OAuthError::Discovery("Unterminated resource_metadata value".into())
-    })?;
+    let end = rest
+        .find('"')
+        .ok_or_else(|| OAuthError::Discovery("Unterminated resource_metadata value".into()))?;
 
     Ok(rest[..end].to_string())
 }
 
 /// Step 2: Fetch protected resource metadata (RFC 9728), extract issuer.
-async fn fetch_resource_metadata(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<String, OAuthError> {
-    let resp = http
-        .get(url)
-        .send()
-        .await?;
+async fn fetch_resource_metadata(http: &reqwest::Client, url: &str) -> Result<String, OAuthError> {
+    let resp = http.get(url).send().await?;
 
     if !resp.status().is_success() {
         return Err(OAuthError::Discovery(format!(
@@ -104,9 +115,7 @@ async fn fetch_resource_metadata(
         .first()
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            OAuthError::Discovery("Empty authorization_servers array".into())
-        })
+        .ok_or_else(|| OAuthError::Discovery("Empty authorization_servers array".into()))
 }
 
 /// Step 3: Fetch authorization server metadata (RFC 8414).
@@ -122,10 +131,7 @@ async fn fetch_as_metadata(
 ) -> Result<OAuthMetadata, OAuthError> {
     let url = build_as_metadata_url(issuer)?;
 
-    let resp = http
-        .get(&url)
-        .send()
-        .await?;
+    let resp = http.get(&url).send().await?;
 
     if !resp.status().is_success() {
         return Err(OAuthError::Discovery(format!(
@@ -134,9 +140,10 @@ async fn fetch_as_metadata(
         )));
     }
 
-    let metadata: OAuthMetadata = resp.json().await.map_err(|e| {
-        OAuthError::Discovery(format!("Failed to parse AS metadata: {e}"))
-    })?;
+    let metadata: OAuthMetadata = resp
+        .json()
+        .await
+        .map_err(|e| OAuthError::Discovery(format!("Failed to parse AS metadata: {e}")))?;
 
     // Validate issuer matches
     if metadata.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
@@ -154,14 +161,13 @@ async fn fetch_as_metadata(
 /// The well-known suffix is inserted between the authority and the issuer path:
 ///   `https://host/path` → `https://host/.well-known/oauth-authorization-server/path`
 fn build_as_metadata_url(issuer: &str) -> Result<String, OAuthError> {
-    let parsed = reqwest::Url::parse(issuer).map_err(|e| {
-        OAuthError::Discovery(format!("Invalid issuer URL '{issuer}': {e}"))
-    })?;
+    let parsed = reqwest::Url::parse(issuer)
+        .map_err(|e| OAuthError::Discovery(format!("Invalid issuer URL '{issuer}': {e}")))?;
 
     let scheme = parsed.scheme();
-    let host = parsed.host_str().ok_or_else(|| {
-        OAuthError::Discovery(format!("Issuer URL has no host: {issuer}"))
-    })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| OAuthError::Discovery(format!("Issuer URL has no host: {issuer}")))?;
     let origin = match parsed.port() {
         Some(port) => format!("{scheme}://{host}:{port}"),
         None => format!("{scheme}://{host}"),
@@ -171,7 +177,9 @@ fn build_as_metadata_url(issuer: &str) -> Result<String, OAuthError> {
     if path.is_empty() {
         Ok(format!("{origin}/.well-known/oauth-authorization-server"))
     } else {
-        Ok(format!("{origin}/.well-known/oauth-authorization-server/{path}"))
+        Ok(format!(
+            "{origin}/.well-known/oauth-authorization-server/{path}"
+        ))
     }
 }
 
@@ -191,7 +199,8 @@ mod tests {
 
     #[test]
     fn parses_resource_metadata_with_extra_params() {
-        let header = r#"Bearer realm="jmap", resource_metadata="https://example.com/meta", scope="mail""#;
+        let header =
+            r#"Bearer realm="jmap", resource_metadata="https://example.com/meta", scope="mail""#;
         let url = parse_resource_metadata_url(header).unwrap();
         assert_eq!(url, "https://example.com/meta");
     }
@@ -203,15 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn builds_same_origin_resource_metadata_url() {
+        let url = same_origin_resource_metadata_url("https://mail.example/jmap/session").unwrap();
+        assert_eq!(
+            url,
+            "https://mail.example/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[test]
     fn builds_as_metadata_url_no_path() {
         let url = build_as_metadata_url("https://auth.example.com").unwrap();
-        assert_eq!(url, "https://auth.example.com/.well-known/oauth-authorization-server");
+        assert_eq!(
+            url,
+            "https://auth.example.com/.well-known/oauth-authorization-server"
+        );
     }
 
     #[test]
     fn builds_as_metadata_url_with_trailing_slash() {
         let url = build_as_metadata_url("https://auth.example.com/").unwrap();
-        assert_eq!(url, "https://auth.example.com/.well-known/oauth-authorization-server");
+        assert_eq!(
+            url,
+            "https://auth.example.com/.well-known/oauth-authorization-server"
+        );
     }
 
     #[test]
