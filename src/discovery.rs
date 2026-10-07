@@ -17,10 +17,12 @@ pub async fn discover_oauth_metadata(resource_url: &str) -> Result<OAuthMetadata
         .build()?;
 
     // Step 1: Unauthenticated GET to discover resource metadata URL
-    let resource_metadata_url = discover_resource_metadata_url(&http, resource_url).await?;
+    let (resource_metadata_url, fallback_url) =
+        discover_resource_metadata_url(&http, resource_url).await?;
 
     // Step 2: Fetch protected resource metadata
-    let issuer = fetch_resource_metadata(&http, &resource_metadata_url).await?;
+    let issuer =
+        fetch_resource_metadata(&http, &resource_metadata_url, fallback_url.as_deref()).await?;
 
     // Step 3: Fetch authorization server metadata
     fetch_as_metadata(&http, &issuer).await
@@ -30,16 +32,25 @@ pub async fn discover_oauth_metadata(resource_url: &str) -> Result<OAuthMetadata
 async fn discover_resource_metadata_url(
     http: &reqwest::Client,
     resource_url: &str,
-) -> Result<String, OAuthError> {
+) -> Result<(String, Option<String>), OAuthError> {
     let resp = http.get(resource_url).send().await?;
 
     // RFC 9728 normally advertises the metadata URL in a 401 challenge. Some
     // servers (including Stalwart deployments behind a public reverse proxy)
     // answer the unauthenticated request successfully; try the standard
-    // same-origin well-known endpoint in that case.
+    // path-scoped well-known endpoint in that case. An origin-only endpoint
+    // remains a compatibility fallback, but only when the scoped one is absent.
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
         if resp.status().is_success() {
-            return same_origin_resource_metadata_url(resource_url);
+            let url = same_origin_resource_metadata_url(resource_url)?;
+            let mut fallback = reqwest::Url::parse(&url).map_err(|e| {
+                OAuthError::Discovery(format!("Invalid metadata URL: {e}"))
+            })?;
+            fallback.set_path("/.well-known/oauth-protected-resource");
+            fallback.set_query(None);
+            let fallback = fallback.to_string();
+            let fallback = (fallback != url).then_some(fallback);
+            return Ok((url, fallback));
         }
         return Err(OAuthError::Discovery(format!(
             "Expected 401 from unauthenticated resource request, got {}",
@@ -56,21 +67,29 @@ async fn discover_resource_metadata_url(
         })?;
 
     // Parse: Bearer resource_metadata="https://..."
-    parse_resource_metadata_url(www_auth)
+    parse_resource_metadata_url(www_auth).map(|url| (url, None))
 }
 
 fn same_origin_resource_metadata_url(resource_url: &str) -> Result<String, OAuthError> {
     let parsed = reqwest::Url::parse(resource_url).map_err(|e| {
         OAuthError::Discovery(format!("Invalid resource URL '{resource_url}': {e}"))
     })?;
-    let host = parsed.host_str().ok_or_else(|| {
+    parsed.host_str().ok_or_else(|| {
         OAuthError::Discovery(format!("Resource URL has no host: {resource_url}"))
     })?;
-    let origin = match parsed.port() {
-        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
-        None => format!("{}://{host}", parsed.scheme()),
+    let path = if parsed.path() == "/" {
+        ""
+    } else {
+        parsed.path()
     };
-    Ok(format!("{origin}/.well-known/oauth-protected-resource"))
+    let query = parsed
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    Ok(format!(
+        "{}/.well-known/oauth-protected-resource{path}{query}",
+        parsed.origin().ascii_serialization()
+    ))
 }
 
 /// Parse `resource_metadata` from a `WWW-Authenticate: Bearer` header value.
@@ -92,8 +111,16 @@ fn parse_resource_metadata_url(www_auth: &str) -> Result<String, OAuthError> {
 }
 
 /// Step 2: Fetch protected resource metadata (RFC 9728), extract issuer.
-async fn fetch_resource_metadata(http: &reqwest::Client, url: &str) -> Result<String, OAuthError> {
+async fn fetch_resource_metadata(
+    http: &reqwest::Client,
+    url: &str,
+    fallback_url: Option<&str>,
+) -> Result<String, OAuthError> {
     let resp = http.get(url).send().await?;
+    let resp = match (resp.status(), fallback_url) {
+        (reqwest::StatusCode::NOT_FOUND, Some(fallback)) => http.get(fallback).send().await?,
+        _ => resp,
+    };
 
     if !resp.status().is_success() {
         return Err(OAuthError::Discovery(format!(
@@ -216,8 +243,71 @@ mod tests {
         let url = same_origin_resource_metadata_url("https://mail.example/jmap/session").unwrap();
         assert_eq!(
             url,
+            "https://mail.example/.well-known/oauth-protected-resource/jmap/session"
+        );
+    }
+
+    #[test]
+    fn resource_metadata_preserves_ipv6_port_path_and_query() {
+        assert_eq!(
+            same_origin_resource_metadata_url("https://[::1]:8443/jmap/session?tenant=alice").unwrap(),
+            "https://[::1]:8443/.well-known/oauth-protected-resource/jmap/session?tenant=alice"
+        );
+        assert_eq!(
+            same_origin_resource_metadata_url("https://mail.example/").unwrap(),
             "https://mail.example/.well-known/oauth-protected-resource"
         );
+    }
+
+    #[test]
+    fn path_metadata_404_retries_origin_endpoint() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (path, status, body) in [
+                ("/jmap/session", "200 OK", ""),
+                (
+                    "/.well-known/oauth-protected-resource/jmap/session",
+                    "404 Not Found",
+                    "",
+                ),
+                (
+                    "/.well-known/oauth-protected-resource",
+                    "200 OK",
+                    r#"{"authorization_servers":["https://auth.example"]}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                let count = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let (url, fallback) =
+                discover_resource_metadata_url(&http, &format!("{origin}/jmap/session"))
+                    .await
+                    .unwrap();
+            let issuer = fetch_resource_metadata(&http, &url, fallback.as_deref())
+                .await
+                .unwrap();
+            assert_eq!(issuer, "https://auth.example");
+        });
+        server.join().unwrap();
     }
 
     #[test]
